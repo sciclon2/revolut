@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Infrastructure for the Go API application
+
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy the resources
+
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets to deploy the resources
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+
+  DockerImage:
+    Type: String
+    Description: Docker image to use for the application
+
+  DockerImageTag:
+    Type: String
+    Description: Tag of the Docker image to use
+
+  AMIId:
+    Type: String
+    Description: AMI ID to use for the EC2 instances
+    Default: ami-0a887e401f7654935  # Default to Amazon Linux 2023 AMI in us-east-1
+
+Resources:
+  # Security Group for RDS
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow database access
+      VpcId: !Ref VPC
+
+  # Security Group for EC2 instances
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH access
+      VpcId: !Ref VPC
+
+  # Security Group Ingress for RDS from EC2
+  RDSSecurityGroupIngressFromEC2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+  # Security Group Ingress for EC2 HTTP
+  EC2SecurityGroupIngressHTTP:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+
+  # Security Group Ingress for EC2 SSH
+  EC2SecurityGroupIngressSSH:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: 0.0.0.0/0
+
+  # Generate DB Username and Password
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-DBSecret"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "testdb"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\\'
+
+  # RDS Instance
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t3.micro
+      Engine: postgres
+      MasterUsername: !Join ['', [ '{{resolve:secretsmanager:', !Ref DBSecret, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', [ '{{resolve:secretsmanager:', !Ref DBSecret, ':SecretString:password}}' ]]
+      AllocatedStorage: 20
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnet group for RDS instance"
+      SubnetIds: !Ref Subnets
+
+  # IAM Role for SSM and Secrets Manager
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SSMAndSecretsManagerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:StartSession
+                  - secretsmanager:GetSecretValue
+                Resource: "*"
+
+  # Instance Profile for EC2
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref IAMRole
+
+  # Launch Configuration
+  LaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref AMIId
+      InstanceType: t3.micro
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroups:
+        - !Ref EC2SecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+          set -e
+
+          echo "  Updating all packages..."
+          dnf update -y || yum update -y
+
+          echo "  Installing Docker and jq..."
+          dnf install -y docker jq || yum install -y docker jq
+
+          echo "  Starting and enabling Docker service..."
+          systemctl start docker
+          systemctl enable docker
+
+          echo "  Adding ec2-user to the Docker group..."
+          usermod -aG docker ec2-user || usermod -aG docker root
+
+          echo "  Fetching database credentials from AWS Secrets Manager..."
+          DB_HOST=${RDSInstance.Endpoint.Address}
+          DB_SECRET=$(aws secretsmanager get-secret-value --secret-id ${DBSecret} --query SecretString --output text)
+
+          if [ $? -ne 0 ]; then
+            echo "  Failed to retrieve secrets from Secrets Manager"
+            exit 1
+          fi
+
+          DB_USER=$(echo $DB_SECRET | jq -r .username)
+          DB_PASS=$(echo $DB_SECRET | jq -r .password)
+          DB_NAME="testdb"
+
+          echo "  DB_HOST: $DB_HOST"
+          echo "  DB_USER: $DB_USER"
+          echo "  DB_PASS: $DB_PASS"
+          echo "  DB_NAME: $DB_NAME"
+
+          if [ -z "$DB_USER" ] || [ -z "$DB_PASS" ] || [ -z "$DB_NAME" ]; then
+            echo "  Database credentials are empty"
+            exit 1
+          fi
+
+          echo "  Running the Docker container..."
+          CONTAINER_ID=$(docker run -d -p 80:8080 --env DB_SSL_MODE=require --env DB_HOST=$DB_HOST --env DB_USER=$DB_USER --env DB_PASS=$DB_PASS --env DB_NAME=$DB_NAME ${DockerImage}:${DockerImageTag})
+
+          if [ $? -ne 0 ]; then
+            echo "  Failed to start the Docker container"
+            exit 1
+          fi
+
+          echo "  Docker container started with ID $CONTAINER_ID"
+
+          # Adding a check to log Docker container output for debugging
+          sleep 10
+          docker logs $CONTAINER_ID
+
+          echo "  Docker container logs printed above"
+
+  # Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref Subnets
+      LaunchConfigurationName: !Ref LaunchConfig
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT1M
+
+  # Load Balancer
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets: !Ref Subnets
+      SecurityGroups:
+        - !Ref EC2SecurityGroup
+
+  # Target Group for Load Balancer
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /health
+
+  # Listener for Load Balancer
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      Port: 80
+      Protocol: HTTP
+
+Outputs:
+  LoadBalancerDNSName:
+    Description: "The DNS name of the load balancer"
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-LoadBalancerDNSName"

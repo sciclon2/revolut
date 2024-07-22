@@ -1,0 +1,191 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  release:
+    types: [created]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.19
+
+      - name: Initialize and Tidy Go module
+        run: |
+          if [ ! -f go.mod ]; then
+            go mod init github.com/scilcon2/revolut_homework
+          fi
+          go mod tidy
+
+      - name: Run unit tests
+        run: go test -v -tags=unit ./...
+
+      - name: Upload Go module files
+        uses: actions/upload-artifact@v2
+        with:
+          name: go-mod-files
+          path: |
+            go.mod
+            go.sum
+
+  acceptance-tests:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    services:
+      docker:
+        image: docker:19.03.12
+        options: --privileged
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Download Go module files
+        uses: actions/download-artifact@v2
+        with:
+          name: go-mod-files
+
+      - name: Set up Docker Compose
+        run: |
+          docker-compose -f docker/docker-compose.yml down -v
+          docker-compose -f docker/docker-compose.yml up -d --build
+
+      - name: Run acceptance tests
+        env:
+          DB_HOST: postgres
+          DB_PORT: 5432
+          DB_USER: testuser
+          DB_PASS: testpass
+          DB_NAME: testdb
+          DB_SSL_MODE: disable  # Set to disable for testing
+
+        run: go test -v -tags=acceptance ./...
+
+      - name: Tear down Docker Compose
+        run: docker-compose -f docker/docker-compose.yml down
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: acceptance-tests
+    if: github.event_name == 'release'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          docker build -t sciclon2/api:${IMAGE_TAG} -f docker/Dockerfile .
+          docker tag sciclon2/api:${IMAGE_TAG} sciclon2/api:latest
+          docker push sciclon2/api:${IMAGE_TAG}
+          docker push sciclon2/api:latest
+
+
+  docker-dev:
+    runs-on: ubuntu-latest
+    needs: acceptance-tests
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG=dev-${{ github.sha }}
+          docker build -t sciclon2/api:${IMAGE_TAG} -f docker/Dockerfile .
+          docker push sciclon2/api:${IMAGE_TAG}
+
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.event_name == 'release'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Read configuration file
+        id: read-config
+        run: |
+          config=$(cat config/config.json)
+          AWS_REGION=$(echo "$config" | jq -r .aws_region)
+          echo "AWS_REGION=$AWS_REGION" >> $GITHUB_ENV
+          VPC=$(echo "$config" | jq -r .vpc_id)
+          echo "VPC=$VPC" >> $GITHUB_ENV
+          SUBNETS=$(echo "$config" | jq -r '.subnets | join(",")')
+          echo "SUBNETS=$SUBNETS" >> $GITHUB_ENV
+          KEY_NAME=$(echo "$config" | jq -r .key_name)
+          echo "KEY_NAME=$KEY_NAME" >> $GITHUB_ENV
+          AMI_ID=$(echo "$config" | jq -r .ami_id)
+          echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
+          echo "DOCKER_IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Debug environment variables
+        run: |
+          echo "AWS_REGION=${{ env.AWS_REGION }}"
+          echo "VPC=${{ env.VPC }}"
+          echo "SUBNETS=${{ env.SUBNETS }}"
+          echo "KEY_NAME=${{ env.KEY_NAME }}"
+          echo "AMI_ID=${{ env.AMI_ID }}"
+          echo "DOCKER_IMAGE_TAG=${{ env.DOCKER_IMAGE_TAG }}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file cloudformation/template.yaml \
+            --stack-name go-api-stack \
+            --parameter-overrides \
+              VPC=${{ env.VPC }} \
+              Subnets=${{ env.SUBNETS }} \
+              KeyName=${{ env.KEY_NAME }} \
+              DockerImage=sciclon2/api \
+              DockerImageTag=${{ env.DOCKER_IMAGE_TAG }} \
+              AMIId=${{ env.AMI_ID }} \
+            --capabilities CAPABILITY_IAM
+
+      - name: Get Load Balancer DNS Name
+        id: get-lb-dns
+        run: |
+          aws cloudformation describe-stacks --stack-name go-api-stack --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerDNSName'].OutputValue" --output text > lb_dns_name.txt
+          cat lb_dns_name.txt
+
+      - name: Inform About Access
+        run: |
+          LB_DNS_NAME=$(cat lb_dns_name.txt)
+          echo "The application is accessible at: http://$LB_DNS_NAME"

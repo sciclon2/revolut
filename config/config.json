@@ -1,0 +1,7 @@
+{
+  "aws_region": "eu-central-1",
+  "vpc_id": "vpc-048a7d245f194125f",
+  "subnets": ["subnet-0aec7d1e60dc2dffd", "subnet-00ef882fbff1883b7", "subnet-097a8e8538c4425e7"],
+  "key_name": "devops",
+  "ami_id": "ami-0346fd83e3383dcb4"
+}
