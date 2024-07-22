@@ -81,11 +81,9 @@ go test -v -tags=unit ./...
 ## Acceptance Tests
 To run acceptance tests, ensure the Docker containers are running:
 ```bash
-./scripts/setup_ssl_postgres.sh
 docker-compose -f docker/docker-compose.yml down -v
 docker-compose -f docker/docker-compose.yml up -d
 go test -v -tags=acceptance ./...
-docker-compose -f docker/docker-compose.yml down -v
 ```
 
 
